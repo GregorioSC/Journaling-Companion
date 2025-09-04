@@ -16,8 +16,9 @@ export function SentimentChart({
   return (
     <div className="w-full">
       <p className="text-sm text-muted-foreground mb-2">
-        Sentiment ranges from <b>-1</b> (closer to sad/negative) to <b>+1</b>{" "}
-        (closer to happy/positive).
+        Sentiment ranges from <b>-1</b> to <b>+1</b>{" "}
+        the closer to -1 you are your Entries contain more Negative Emotion, while the closer to
+        +1 you are your Entries contain more Postive Emotion.
       </p>
       <div className="h-64 w-full">
         <ResponsiveContainer width="100%" height="100%">

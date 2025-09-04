@@ -1,150 +1,212 @@
 # services/ai_prompts.py
+"""
+Context-aware prompt generator using an instruction-tuned model (FLAN-T5).
+Generates short, varied, human-sounding reflection questions.
+
+This version is DAO-flexible:
+- Works with EntryDAO.list_recent_by_user(...) if present
+- Falls back to EntryDAO.list_by_user(...)
+- Or filters EntryDAO.list_recent(...) by user_id
+
+Requires: transformers, torch, sentencepiece, safetensors
+"""
+
 from __future__ import annotations
-import json
 import random
-from typing import List, Tuple, Dict, Any
-import numpy as np
+import re
+from typing import List, Sequence, Any, Optional
 
-from services.ai_sentiment import AISentiment
-from dao.insight_dao import InsightDAO
+import torch
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-# --- Rotating prompt bank used when context is sparse/empty ---
-PROMPT_BANK = [
-    "What drained your energy today, and what restored it?",
-    "Which moment would you like to remember from today?",
-    "What’s one belief that helped or hurt you today?",
-    "Where did you feel most at ease?",
-    "What did you avoid today, and why?",
-    "Who supported you recently, and how could you thank them?",
-    "What small question are you sitting with right now?",
-    "If today had a headline, what would it be?",
-    "What would ‘1% better’ look like tomorrow?",
-    "What do you want to let go of before bed?",
-    "What gave you a spark of curiosity?",
-    "What did your body need today?",
-    "What was unexpectedly harder than you thought?",
-    "Where did you show courage, even if small?",
-    "What would be a kind next step for yourself?",
-]
+from dao.entry_dao import EntryDAO
 
-GRATITUDE_TEMPLATES = [
-    "Name one small win you’re grateful for today.",
-    "What quietly went right today?",
-    "Who or what made today a little easier?",
-]
+MODEL_NAME = "google/flan-t5-base"  # lightweight instruction-tuned model
 
-ACTION_TEMPLATES = [
-    "What’s one tiny action you’ll try tomorrow?",
-    "What is a 5-minute step you can take next?",
-    "What would help you start gently tomorrow?",
-]
+# Decoding settings for variety without going off the rails
+GEN_CFG = {
+    "do_sample": True,
+    "temperature": 0.95,  # jittered slightly per call
+    "top_p": 0.9,
+    "top_k": 60,
+    "repetition_penalty": 1.12,
+    "max_new_tokens": 80,
+    "num_return_sequences": 1,
+}
 
 
-def _cosine(a: List[float], b: List[float]) -> float:
-    A = np.asarray(a, dtype=float)
-    B = np.asarray(b, dtype=float)
-    denom = float(np.linalg.norm(A) * np.linalg.norm(B))
-    return float((A @ B) / denom) if denom else 0.0
+def _strip_bullets(line: str) -> str:
+    # remove "1. ", "- ", "* ", "• ", etc.
+    return re.sub(r"^\s*(?:\d+[\).\]]\s*|[-*•]\s*)", "", line).strip()
+
+
+def _jaccard(a: str, b: str) -> float:
+    ta = set(re.findall(r"[a-zA-Z']{2,}", a.lower()))
+    tb = set(re.findall(r"[a-zA-Z']{2,}", b.lower()))
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def _get_field(obj: Any, key: str, default: Any = None) -> Any:
+    """Access obj.key or obj['key'] interchangeably."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
 
 
 class AIPrompts:
-    """
-    Generates reflective prompts using nearest past entries (by embedding),
-    and rotates a bank of prompts when context is sparse.
-    """
+    def __init__(self, entry_dao: Optional[EntryDAO] = None):
+        self._tok = None
+        self._model = None
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.entries = entry_dao or EntryDAO()
 
-    def __init__(self, ai: AISentiment, insights: InsightDAO):
-        self.ai = ai
-        self.insights = insights
+    # Lazy-load model to keep startup snappy
+    def _ensure_loaded(self):
+        if self._tok is None or self._model is None:
+            self._tok = AutoTokenizer.from_pretrained(MODEL_NAME)
+            self._model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+            self._model.to(self._device)
+            self._model.eval()
 
-    def _decode_embedding(self, v) -> List[float] | None:
-        if v is None:
-            return None
-        if isinstance(v, str):
+    # ---- DAO-flexible fetch -------------------------------------------------
+
+    def _fetch_recent_for_user(self, user_id: int, limit: int = 50) -> List[Any]:
+        """
+        Try common DAO shapes without crashing:
+        - list_recent_by_user(user_id, limit=?)
+        - list_by_user(user_id)
+        - list_recent(limit=?), then filter by user_id
+        """
+        # 1) list_recent_by_user
+        if hasattr(self.entries, "list_recent_by_user"):
             try:
-                return json.loads(v)
+                return self.entries.list_recent_by_user(user_id=user_id, limit=limit)  # type: ignore[attr-defined]
             except Exception:
-                return None
-        if isinstance(v, list):
-            return v
-        return None
+                pass
 
-    def _decode_themes(self, v) -> List[str]:
-        if v is None:
-            return []
-        if isinstance(v, str):
+        # 2) list_by_user
+        if hasattr(self.entries, "list_by_user"):
             try:
-                out = json.loads(v)
-                return out if isinstance(out, list) else []
+                rows = self.entries.list_by_user(user_id=user_id)  # type: ignore[attr-defined]
+                # If there's a lot, trim to most recent-ish order if available
+                return rows[:limit] if isinstance(rows, list) else rows
             except Exception:
-                return []
-        if isinstance(v, list):
-            return [str(x) for x in v]
+                pass
+
+        # 3) list_recent (filter client-side)
+        if hasattr(self.entries, "list_recent"):
+            try:
+                rows = self.entries.list_recent(limit=max(2000, limit))  # type: ignore[attr-defined]
+                return [r for r in rows if _get_field(r, "user_id") == user_id][:limit]
+            except Exception:
+                pass
+
         return []
 
-    def retrieve_context(
-        self, user_id: int, query: str, k: int = 5
-    ) -> List[Dict[str, Any]]:
-        qv = self.ai.embed_query(query)
-        rows = self.insights.get_for_user(user_id=user_id, limit=300)
-        scored: List[Tuple[float, Dict[str, Any]]] = []
-        for r in rows:
-            emb = self._decode_embedding(r.get("embedding"))
-            if emb:
-                sim = _cosine(qv, emb)
-                scored.append((sim, r))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [r for _, r in scored[:k]]
+    # ------------------------------------------------------------------------
 
-    def _sparse_fallback(self, n: int = 3) -> List[str]:
-        """Return n distinct prompts from the rotating bank."""
-        n = max(1, min(n, len(PROMPT_BANK)))
-        return random.sample(PROMPT_BANK, n)
+    def _sample_context_snippets(self, user_id: int, k_entries: int = 5) -> List[str]:
+        """
+        Pull recent entries for the user, then sample a few varied snippets.
+        Always include the most recent so prompts feel current.
+        """
+        rows = self._fetch_recent_for_user(user_id=user_id, limit=50)
+        if not rows:
+            return []
 
-    def generate(
-        self, user_id: int, goal: str | None, k_context: int = 5
-    ) -> Tuple[List[str], List[int]]:
-        goal = (goal or "daily reflection").strip()
-        ctx = self.retrieve_context(user_id, goal, k_context)
+        # Assume rows are already recent-first; safest we can do without strict schema.
+        texts = [_get_field(r, "text", "") for r in rows]
+        texts = [t.strip() for t in texts if t and t.strip()]
+        if not texts:
+            return []
 
-        ctx_themes: List[str] = []
-        for r in ctx:
-            ctx_themes.extend(self._decode_themes(r.get("themes")))
-        has_themes = any(t for t in ctx_themes)
+        latest = texts[0]
+        pool = texts[1:15] if len(texts) > 1 else []
+        random.shuffle(pool)
+        pick = [latest] + pool[: max(0, min(k_entries - 1, len(pool)))]
 
-        if len(ctx) == 0 or not has_themes:
+        # Trim very long notes to keep instruction short
+        trimmed = []
+        for t in pick:
+            if len(t) > 420:
+                head = t[:210]
+                tail = t[-120:]
+                t = head + " … " + tail
+            trimmed.append(t)
+        return trimmed
 
-            return (
-                self._sparse_fallback(3),
-                [] if len(ctx) == 0 else [int(r["entry_id"]) for r in ctx],
-            )
+    def suggest(
+        self, *, user_id: int, k: int = 5, goal_hint: Optional[str] = None
+    ) -> List[str]:
+        """
+        Generate K short reflection questions grounded in the user's recent entries.
+        """
+        self._ensure_loaded()
 
-        top = ctx[0]
-        themes = [t for t in self._decode_themes(top.get("themes")) if t]
-        prompts: List[str] = []
+        context_snips = self._sample_context_snippets(user_id, k_entries=5)
+        context_block = (
+            "No prior notes available."
+            if not context_snips
+            else "\n".join(f"- {s}" for s in context_snips)
+        )
 
-        if themes:
-            t = themes[0]
-            t_disp = f"“{t}”" if " " in t else t
-            prompts.append(f"Today, did {t_disp} feel better, worse, or the same?")
+        # Add a little stylistic variety
+        tone = random.choice(["supportive", "practical", "curious"])
+        k = max(3, min(7, k))
 
-        vals = [float(r.get("sentiment") or 0.0) for r in ctx]
-        avg = sum(vals) / max(1, len(vals))
-        if avg < 0:
-            prompts.append("Where did you find a small moment of relief today?")
-        else:
-            prompts.append(random.choice(GRATITUDE_TEMPLATES))
+        instruction = (
+            f"You are a {tone} journaling coach.\n"
+            f"Based on the user's recent notes, craft {k} short, distinct reflection questions. "
+            "Each should be actionable and specific; avoid repeating phrases. "
+            "Keep every question to one sentence.\n"
+            + (f"User goal/hint: {goal_hint}\n" if goal_hint else "")
+            + "Recent notes:\n"
+            f"{context_block}\n\n"
+            "Return only the questions, each on its own line."
+        )
 
-        prompts.append(random.choice(ACTION_TEMPLATES))
+        # Jitter temperature slightly for freshness
+        gcfg = GEN_CFG.copy()
+        jitter = random.uniform(-0.1, 0.1)
+        gcfg["temperature"] = max(0.8, min(1.1, GEN_CFG["temperature"] + jitter))
 
-        entry_ids = [int(r["entry_id"]) for r in ctx if r.get("entry_id") is not None]
+        inputs = self._tok(instruction, return_tensors="pt").to(self._device)
+        with torch.no_grad():
+            out = self._model.generate(**inputs, **gcfg)
 
-        seen = set()
-        deduped = []
-        for p in prompts:
-            if p not in seen:
-                deduped.append(p)
-                seen.add(p)
-            if len(deduped) == 3:
+        text = self._tok.decode(out[0], skip_special_tokens=True)
+
+        # Split lines, clean bullets and numbers
+        lines = [_strip_bullets(s) for s in text.splitlines()]
+        lines = [s for s in lines if s and len(s) > 3]
+
+        # De-dup by Jaccard similarity
+        final: List[str] = []
+        for s in lines:
+            if all(_jaccard(s, t) < 0.6 for t in final):
+                final.append(s)
+            if len(final) >= k:
                 break
-        return deduped, entry_ids
+
+        # Fallback bank if model returns too few
+        if len(final) < k:
+            bank = [
+                "What is a 5-minute step you can take next?",
+                "Who or what made today a little easier?",
+                "What felt heavy or light today, and why?",
+                "What boundary could protect your energy this week?",
+                "What small win are you grateful for today?",
+                "What would make tomorrow 1% better?",
+            ]
+            random.shuffle(bank)
+            for q in bank:
+                if all(_jaccard(q, t) < 0.6 for t in final):
+                    final.append(q)
+                if len(final) >= k:
+                    break
+
+        return final

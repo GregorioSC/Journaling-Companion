@@ -7,7 +7,7 @@ from datetime import datetime
 from api.deps import get_current_user
 from api.schemas.insight import PromptRequest, PromptResponse, WeeklySummary
 from services.ai_sentiment import AISentiment
-from services.ai_prompts import AIPrompts
+from services.ai_prompts import AIPrompts  # <-- uses new FLAN-T5 prompt generator
 from services.ai_summary import AISummary
 from dao.insight_dao import InsightDAO
 from dao.entry_dao import EntryDAO
@@ -18,7 +18,9 @@ router = APIRouter(prefix="/ai", tags=["ai"])
 _ai = AISentiment()
 _insights = InsightDAO()
 _entries = EntryDAO()
-_prompter = AIPrompts(_ai, _insights)
+
+# CHANGED: new AIPrompts signature takes an EntryDAO (optional), not AISentiment/InsightDAO
+_prompter = AIPrompts(entry_dao=_entries)
 _summarizer = AISummary(_insights)
 
 
@@ -51,8 +53,22 @@ def _fetch_entry(entry_id: int) -> Optional[Any]:
 
 @router.post("/prompt", response_model=PromptResponse)
 def make_prompts(body: PromptRequest, current=Depends(get_current_user)):
-    prompts, ctx_ids = _prompter.generate(current.id, body.goal, body.k_context)
-    return PromptResponse(prompts=prompts, context_entry_ids=ctx_ids)
+    """
+    Generate K short, varied reflection prompts using the FLAN-T5 prompter.
+    - body.goal       -> goal_hint
+    - body.k_context  -> k (how many prompts to return)
+    """
+    k = body.k_context or 5
+    # keep prompts between 3 and 7 so they read well
+    k = max(3, min(7, k))
+
+    prompts = _prompter.suggest(
+        user_id=current.id,
+        k=k,
+        goal_hint=body.goal or None,
+    )
+    # New prompter doesn’t return context IDs; UI doesn’t use them, so return empty list.
+    return PromptResponse(prompts=prompts, context_entry_ids=[])
 
 
 @router.get("/summary/weekly", response_model=WeeklySummary)
