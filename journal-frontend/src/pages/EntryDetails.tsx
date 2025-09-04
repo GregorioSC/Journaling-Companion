@@ -147,9 +147,7 @@ export default function EntryDetails() {
             </div>
           )}
           <div className="flex items-center gap-2 mt-3">
-            <Button variant="outline" onClick={handleAnalyze} disabled={aiBusy}>
-              {aiBusy ? "Analyzing..." : "Analyze with AI"}
-            </Button>
+
             <Button variant="outline" onClick={handleAskAI} disabled={aiBusy}>
               {aiBusy ? "Thinking..." : "Ask AI"}
             </Button>

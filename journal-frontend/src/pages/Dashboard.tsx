@@ -19,6 +19,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { useToast } from "@/components/use-toast"
 import { PromptIdeas } from "@/components/prompt-ideas"
 import { fireConfetti } from "@/components/confetti"
+import { Badge } from "@/components/ui/badge"
 
 export default function Dashboard() {
   const { user } = useAuth()
@@ -147,6 +148,16 @@ export default function Dashboard() {
     }
   }
 
+  const weekRange = useMemo(() => {
+    if (!weekly?.week_start) return ""
+    const start = new Date(weekly.week_start)
+    const end = new Date(start)
+    end.setDate(start.getDate() + 6)
+    const fmt = (d: Date) =>
+      d.toLocaleDateString(undefined, { month: "short", day: "numeric" })
+    return `${fmt(start)} – ${fmt(end)}`
+  }, [weekly?.week_start])
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
       <div className="lg:col-span-2 space-y-6">
@@ -204,7 +215,7 @@ export default function Dashboard() {
               {aiBusy ? "Thinking..." : "Ask AI"}
             </Button>
             <Button variant="outline" onClick={handleWeekly} disabled={weeklyBusy}>
-              {weeklyBusy ? "Summarizing..." : "Summarize"}
+              {weeklyBusy ? "Summarizing..." : "Summarize week"}
             </Button>
           </div>
           {aiErr && <div className="text-xs text-red-500 mb-2">{aiErr}</div>}
@@ -224,12 +235,58 @@ export default function Dashboard() {
             </ul>
           )}
           {weeklyErr && <div className="text-xs text-red-500">{weeklyErr}</div>}
+
+          {/* Polished weekly summary card */}
           {weekly && (
-            <div className="rounded-md border p-3">
-              <p className="text-xs text-muted-foreground mb-1">
-                {weekly.week_start}
-              </p>
-              <pre className="whitespace-pre-wrap text-sm">{weekly.summary}</pre>
+            <div className="rounded-lg border bg-card p-6 shadow-sm space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-sm text-muted-foreground">{weekRange || weekly.week_start}</p>
+                </div>
+                <div
+                  className="rounded-full px-3 py-1 text-sm font-medium"
+                  style={{
+                    background:
+                      (weekly.insights.avg_sentiment ?? 0) >= 0
+                        ? "rgba(16,185,129,0.12)" // emerald
+                        : "rgba(239,68,68,0.12)", // red
+                    color:
+                      (weekly.insights.avg_sentiment ?? 0) >= 0
+                        ? "rgb(5,150,105)"
+                        : "rgb(220,38,38)",
+                  }}
+                  title="Average sentiment (−1 to +1)"
+                >
+                  {(weekly.insights.avg_sentiment ?? 0).toFixed(2)}
+                </div>
+              </div>
+
+              <div className="space-y-3 text-base leading-relaxed text-foreground">
+                <p>
+                  🌱{" "}
+                  {weekly.insights.avg_sentiment >= 0
+                    ? "This week generally felt positive — nice work staying grounded."
+                    : "This week felt a bit heavier — thanks for showing up anyway."}
+                </p>
+
+                {weekly.insights.themes?.length ? (
+                  <div>
+                    <p className="mb-2">✨ Recurring themes:</p>
+                    <div className="flex flex-wrap gap-2">
+                      {weekly.insights.themes.map((t: string, i: number) => (
+                        <Badge
+                          key={i}
+                          className="px-3 py-1 rounded-full bg-muted text-sm font-medium text-muted-foreground"
+                        >
+                          {t}
+                        </Badge>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+
+                <p>📝 You logged {weekly.insights.count} entries. That consistency matters.</p>
+              </div>
             </div>
           )}
         </div>
