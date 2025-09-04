@@ -42,7 +42,7 @@ export async function getMe(): Promise<User> {
   return data
 }
 
-/** ✅ NEW: update current user's profile (username, age, gender) */
+
 export async function updateMe(body: Partial<{ username: string; age: number | null; gender: string | null }>): Promise<User> {
   const { data } = await api.patch(`${USERS_BASE}/me`, body, {
     headers: { "Content-Type": "application/json" },

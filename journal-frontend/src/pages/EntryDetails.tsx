@@ -29,6 +29,7 @@ export default function EntryDetails() {
   const [aiBusy, setAiBusy] = useState(false)
   const [aiErr, setAiErr] = useState<string | null>(null)
   const [aiPrompts, setAiPrompts] = useState<string[]>([])
+  const [saving, setSaving] = useState(false)
 
   useEffect(() => {
     (async () => {
@@ -50,9 +51,18 @@ export default function EntryDetails() {
   async function onSave(e: React.FormEvent) {
     e.preventDefault()
     if (!entry) return
-    const updated = await patchEntry(entry.id, { title, text })
-    setEntry(updated)
-    toast("Saved", "Your changes have been saved.")
+    if (!title.trim() || !text.trim()) return
+    try {
+      setSaving(true)
+      const updated = await patchEntry(entry.id, { title, text })
+      setEntry(updated)
+      toast("Saved", "Your changes have been saved.")
+      navigate("/dashboard")
+    } catch (err: any) {
+      toast("Save failed", err?.message || "Could not save entry")
+    } finally {
+      setSaving(false)
+    }
   }
 
   async function onDelete() {
@@ -110,10 +120,9 @@ export default function EntryDetails() {
           <div className="flex gap-2">
             <Button
               type="submit"
-              onClick={onSave}
-              disabled={!title.trim() || !text.trim()}   // block empty title or text
+              disabled={saving || !title.trim() || !text.trim()}   // block empty title or text
             >
-              Save
+              {saving ? "Saving..." : "Save"}
             </Button>
             <Button type="button" variant="destructive" onClick={onDelete}>
               Delete
@@ -147,7 +156,6 @@ export default function EntryDetails() {
             </div>
           )}
           <div className="flex items-center gap-2 mt-3">
-
             <Button variant="outline" onClick={handleAskAI} disabled={aiBusy}>
               {aiBusy ? "Thinking..." : "Ask AI"}
             </Button>
