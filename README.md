@@ -72,10 +72,6 @@ Dev server: **http://localhost:5173**
 
 ---
 
-## Project Structure (high level)
-
-
----
 
 ## Running the Full App
 
