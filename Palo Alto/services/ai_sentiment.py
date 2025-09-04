@@ -1,242 +1,59 @@
 # services/ai_sentiment.py
+from __future__ import annotations
 from typing import List, Tuple
-import re
-from collections import Counter
-
-from sentence_transformers import SentenceTransformer
+import torch
 from transformers import pipeline
+from sentence_transformers import SentenceTransformer
+import numpy as np
 
-_EMB_MODEL = None
-_SENT_PIPE = None
-
-
-def _get_embedder():
-    """Lazy-load the embedding model (e5-base). Produces 768-dim vectors."""
-    global _EMB_MODEL
-    if _EMB_MODEL is None:
-        _EMB_MODEL = SentenceTransformer("intfloat/e5-base")
-    return _EMB_MODEL
-
-
-def _get_sentiment():
-    """Lazy-load the sentiment classifier (SST-2)."""
-    global _SENT_PIPE
-    if _SENT_PIPE is None:
-        _SENT_PIPE = pipeline(
-            task="sentiment-analysis",
-            model="distilbert-base-uncased-finetuned-sst-2-english",
-        )
-    return _SENT_PIPE
+# NEW: better theme extraction
+from services.ai_themes import extract_themes
 
 
 class AISentiment:
-    """
-    Wraps embedding + sentiment + lightweight theme extraction for AI features.
-    """
+    def __init__(self):
+        self._sent_pipe = None
+        self._embed = None
+        self._device = 0 if torch.cuda.is_available() else -1
 
-    def __init__(self, emb_model_name: str = "intfloat/e5-base"):
-        self._emb_model_name = (
-            emb_model_name  # kept for compatibility if you inspect it
-        )
+    def _ensure_sent(self):
+        if self._sent_pipe is None:
+            # simple, accurate SST-2 classifier from HF
+            self._sent_pipe = pipeline(
+                "sentiment-analysis",
+                model="distilbert-base-uncased-finetuned-sst-2-english",
+                device=self._device,
+            )
 
-    # ---------- Embeddings ----------
-    def embed_entries(self, texts: List[str]) -> List[List[float]]:
-        emb = _get_embedder()
-        to_encode = [
-            f"passage: {t}" if not str(t).startswith("passage:") else str(t)
-            for t in texts
-        ]
-        return emb.encode(to_encode, normalize_embeddings=True).tolist()
+    def _ensure_embedder(self):
+        if self._embed is None:
+            # good all-round encoder that works well on journaling text
+            self._embed = SentenceTransformer("intfloat/e5-base")
 
-    def embed_query(self, q: str) -> List[float]:
-        emb = _get_embedder()
-        text = f"query: {q}" if not str(q).startswith("query:") else str(q)
-        return emb.encode([text], normalize_embeddings=True)[0].tolist()
+    # ---- Public API ---------------------------------------------------------
 
-    # ---------- Sentiment + themes ----------
     def analyze_entry(self, text: str) -> Tuple[float, List[str]]:
         """
-        Returns (sentiment in [-1, 1], top themes list).
+        Returns (sentiment_score in [-1, 1], top_themes[List[str]])
         """
-        pipe = _get_sentiment()
-
-        text = (text or "").strip()
-        if not text:
+        if not text or not text.strip():
             return 0.0, []
 
-        out = pipe(text, truncation=True)[
-            0
-        ]  # {'label': 'POSITIVE'|'NEGATIVE', 'score': ...}
-        label = (out.get("label") or "").upper()
-        score = float(out.get("score") or 0.0)
-        signed = score if "POS" in label else -score
+        # sentiment
+        self._ensure_sent()
+        out = self._sent_pipe(text[:4096])[0]
+        label = out["label"].upper()
+        score = float(out["score"])
+        sent = score if label == "POSITIVE" else -score
 
-        return float(signed), self._themes(text)
+        # themes (KeyBERT + YAKE + optional spaCy noun-chunks)
+        themes = extract_themes(text, top_k=3)
 
-    def _themes(self, text: str, k: int = 5) -> List[str]:
-        """
-        Smarter keyword-ish themes:
-        - Lowercase alphas, remove rich stopwords (“today”, “just”, “made”, etc.)
-        - Build unigrams + bigrams
-        - Rank by frequency, prefer longer n-grams
-        """
-        tokens = [w.lower() for w in re.findall(r"[a-zA-Z]{2,}", text)]
-        if not tokens:
-            return []
+        return sent, themes
 
-        stop = {
-            "a",
-            "an",
-            "the",
-            "and",
-            "or",
-            "but",
-            "if",
-            "then",
-            "so",
-            "to",
-            "of",
-            "in",
-            "on",
-            "at",
-            "by",
-            "for",
-            "from",
-            "as",
-            "is",
-            "am",
-            "are",
-            "was",
-            "were",
-            "be",
-            "been",
-            "being",
-            "it",
-            "its",
-            "this",
-            "that",
-            "these",
-            "those",
-            "i",
-            "you",
-            "he",
-            "she",
-            "we",
-            "they",
-            "me",
-            "him",
-            "her",
-            "us",
-            "them",
-            "my",
-            "your",
-            "his",
-            "hers",
-            "our",
-            "their",
-            "with",
-            "about",
-            "into",
-            "over",
-            "after",
-            "before",
-            "up",
-            "down",
-            "out",
-            "off",
-            "than",
-            "too",
-            "very",
-            "also",
-            "what",
-            "when",
-            "where",
-            "which",
-            "who",
-            "how",
-            "why",
-            # journaling fillers
-            "today",
-            "yesterday",
-            "tomorrow",
-            "now",
-            "just",
-            "really",
-            "like",
-            "well",
-            "maybe",
-            "kinda",
-            "sorta",
-            "literally",
-            # common verbs that read weird as “themes”
-            "make",
-            "made",
-            "makes",
-            "do",
-            "did",
-            "done",
-            "doing",
-            "go",
-            "went",
-            "gone",
-            "going",
-            "get",
-            "got",
-            "getting",
-            "feel",
-            "feels",
-            "felt",
-            "think",
-            "thinks",
-            "thought",
-            "say",
-            "says",
-            "said",
-            "want",
-            "wants",
-            "wanted",
-            "need",
-            "needs",
-            "needed",
-            "try",
-            "tries",
-            "tried",
-            "have",
-            "has",
-            "had",
-            "love",
-            "loves",
-            "loved",
-            "life",
-            "day",
-            "today",
-        }
-
-        unigrams = [t for t in tokens if t not in stop and len(t) > 2]
-
-        bigrams = [
-            " ".join(pair)
-            for pair in zip(unigrams, unigrams[1:])
-            if all(len(w) > 2 for w in pair)
-        ]
-
-        counts = Counter(unigrams)
-        bi_counts = Counter(bigrams)
-
-        scores = {}
-        for w, c in counts.items():
-            scores[w] = scores.get(w, 0) + c
-        for w, c in bi_counts.items():
-            scores[w] = scores.get(w, 0) + (c * 1.5)
-
-        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-
-        themes: List[str] = []
-        for w, _ in ranked:
-
-            if any(w in t or t in w for t in themes):
-                continue
-            themes.append(w)
-            if len(themes) >= k:
-                break
-        return themes
+    def embed_entries(self, texts: List[str]) -> List[List[float]]:
+        self._ensure_embedder()
+        vecs = self._embed.encode(texts, normalize_embeddings=True)
+        if isinstance(vecs, np.ndarray):
+            return vecs.tolist()
+        return [list(map(float, v)) for v in vecs]
