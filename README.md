@@ -1,10 +1,11 @@
 # Journaling Companion
-
+## Video link https://youtu.be/h-cVkfm81J8
 A lightweight journaling app with an AI coach.  
 Frontend: React + Vite + Tailwind + shadcn/ui  
 Backend: FastAPI + SQLite + Hugging Face models (sentiment, embeddings) + KeyBERT/YAKE for themes.
 
 ---
+
 
 ## Quick Start
 
